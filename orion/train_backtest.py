@@ -773,8 +773,8 @@ class OrionTrainer:
             eta_min=self.config.get('scheduler_eta_min', 1e-6)
         )
         
-        # Mixed precision scaler
-        self.scaler = GradScaler()
+        # Mixed precision scaler (updated API for torch 2.x)
+        self.scaler = GradScaler('cuda')
         
         # Replay buffer
         self.replay_buffer = ReplayBuffer(
@@ -943,6 +943,85 @@ class OrionTrainer:
         self.model.train()
         return metrics
     
+    def _run_periodic_backtest(self, epoch: int) -> Dict[str, float]:
+        """
+        Run backtest on test data using CURRENT model (not saved checkpoint).
+        
+        This evaluates the current training state on held-out test data
+        to track profitability during training.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            Test performance metrics
+        """
+        logger.info(f"\n{'='*40}")
+        logger.info(f"PERIODIC BACKTEST (Epoch {epoch+1})")
+        logger.info(f"{'='*40}")
+        
+        self.model.eval()
+        
+        state = self.test_env.reset()
+        done = False
+        
+        with torch.no_grad():
+            while not done:
+                state_tensor = state.unsqueeze(0).to(self.device)
+                action, _ = self.model.select_action(
+                    state_tensor,
+                    risk_level=self.config.get('risk_level', 'neutral'),
+                    epsilon=0.0
+                )
+                state, reward, done, info = self.test_env.step(action.item())
+        
+        metrics = self.test_env.get_performance_metrics()
+        
+        logger.info(f"Test Return: {metrics.get('total_return', 0)*100:.2f}%")
+        logger.info(f"Test Sortino: {metrics.get('sortino_ratio', 0):.4f}")
+        logger.info(f"Test Sharpe: {metrics.get('sharpe_ratio', 0):.4f}")
+        logger.info(f"Num Trades: {metrics.get('num_trades', 0)}")
+        
+        self.model.train()
+        return metrics
+    
+    def _save_best_profitable_model(self, epoch: int, metrics: Dict[str, float]) -> None:
+        """
+        Save the most profitable model based on test return.
+        
+        This is separate from validation-based checkpointing.
+        Saves to 'best_profitable_model.pt'.
+        
+        Args:
+            epoch: Current epoch
+            metrics: Test metrics
+        """
+        save_path = Path(self.saver.save_dir) / 'best_profitable_model.pt'
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'test_metrics': metrics,
+            'config': self.config,
+            'best_return': self.best_test_return
+        }
+        
+        torch.save(checkpoint, save_path)
+        
+        logger.info(f"✓ NEW BEST PROFITABLE MODEL SAVED!")
+        logger.info(f"  Epoch: {epoch+1}, Return: {metrics.get('total_return', 0)*100:.2f}%")
+        logger.info(f"  Path: {save_path}")
+        
+        # Also save metrics as JSON
+        metrics_path = Path(self.saver.save_dir) / 'best_profitable_metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump({
+                'epoch': epoch,
+                'metrics': {k: float(v) for k, v in metrics.items()},
+                'timestamp': datetime.now().isoformat()
+            }, f, indent=2)
+    
     def train(self) -> Dict[str, List[float]]:
         """
         Main training loop.
@@ -963,8 +1042,15 @@ class OrionTrainer:
             'loss': [],
             'val_sortino': [],
             'val_sharpe': [],
-            'epsilon': []
+            'epsilon': [],
+            'test_return': [],  # Periodic backtest results
+            'test_sortino': []
         }
+        
+        # Periodic backtest config
+        backtest_freq = self.config.get('backtest_freq', 10)  # Every N epochs
+        self.best_test_return = float('-inf')
+        self.best_test_epoch = -1
         
         epsilon = initial_epsilon
         total_steps = 0
@@ -1010,7 +1096,7 @@ class OrionTrainer:
             history['val_sharpe'].append(val_metrics.get('sharpe_ratio', 0))
             history['epsilon'].append(epsilon)
             
-            # Save if best
+            # Save if best (validation-based)
             self.saver.save_if_best(
                 self.model,
                 self.optimizer,
@@ -1018,6 +1104,25 @@ class OrionTrainer:
                 val_metrics,
                 self.config
             )
+            
+            # ================================================================
+            # PERIODIC BACKTEST (every N epochs) - saves most profitable model
+            # ================================================================
+            if backtest_freq > 0 and (epoch + 1) % backtest_freq == 0:
+                test_metrics = self._run_periodic_backtest(epoch)
+                history['test_return'].append(test_metrics.get('total_return', 0))
+                history['test_sortino'].append(test_metrics.get('sortino_ratio', 0))
+                
+                # Save if most profitable
+                current_return = test_metrics.get('total_return', float('-inf'))
+                if current_return > self.best_test_return:
+                    self.best_test_return = current_return
+                    self.best_test_epoch = epoch
+                    self._save_best_profitable_model(epoch, test_metrics)
+            else:
+                # Append NaN for non-backtest epochs (to keep aligned)
+                history['test_return'].append(float('nan'))
+                history['test_sortino'].append(float('nan'))
             
             # Logging
             epoch_time = time.time() - epoch_start
@@ -1096,6 +1201,83 @@ class OrionTrainer:
             logger.info(f"  {name}: {count} ({pct:.1f}%)")
         
         return metrics
+
+
+# ==============================================================================
+# DATA VALIDATION
+# ==============================================================================
+def validate_data(df: pd.DataFrame, stage: str = "unknown") -> bool:
+    """
+    Validate data before training to catch issues early.
+    
+    Checks for:
+    - NaN/Inf values
+    - Minimum data length
+    - Feature count
+    - Value ranges (detects scaling issues)
+    
+    Args:
+        df: DataFrame to validate
+        stage: Name of the stage (for logging)
+        
+    Returns:
+        True if valid, raises ValueError if not
+    """
+    logger.info(f"\n{'='*40}")
+    logger.info(f"DATA VALIDATION - {stage}")
+    logger.info(f"{'='*40}")
+    
+    issues = []
+    
+    # Check shape
+    logger.info(f"Shape: {df.shape} (rows × features)")
+    
+    if len(df) < 1000:
+        issues.append(f"Insufficient data: {len(df)} rows (need >= 1000)")
+    
+    # Check for NaN
+    nan_count = df.isna().sum().sum()
+    if nan_count > 0:
+        nan_cols = df.columns[df.isna().any()].tolist()
+        issues.append(f"Found {nan_count} NaN values in columns: {nan_cols[:5]}...")
+    else:
+        logger.info("✓ No NaN values")
+    
+    # Check for Inf
+    inf_count = np.isinf(df.values).sum()
+    if inf_count > 0:
+        issues.append(f"Found {inf_count} Inf values")
+    else:
+        logger.info("✓ No Inf values")
+    
+    # Check value ranges (after normalization, values should be reasonable)
+    max_val = df.values.max()
+    min_val = df.values.min()
+    logger.info(f"Value range: [{min_val:.4f}, {max_val:.4f}]")
+    
+    if abs(max_val) > 1000 or abs(min_val) > 1000:
+        logger.warning(f"⚠ Large values detected. Consider checking normalization.")
+    
+    # Check for constant columns (zero variance)
+    std = df.std()
+    zero_var_cols = std[std == 0].index.tolist()
+    if zero_var_cols:
+        logger.warning(f"⚠ Zero-variance columns (will be ignored by model): {zero_var_cols[:5]}")
+    
+    # Feature statistics
+    logger.info(f"Feature statistics (sample):")
+    sample_cols = df.columns[:5].tolist()
+    for col in sample_cols:
+        logger.info(f"  {col}: mean={df[col].mean():.4f}, std={df[col].std():.4f}")
+    
+    # Report issues
+    if issues:
+        for issue in issues:
+            logger.error(f"✗ {issue}")
+        raise ValueError(f"Data validation failed at stage '{stage}': {issues}")
+    
+    logger.info(f"✓ Data validation PASSED for stage: {stage}")
+    return True
 
 
 # ==============================================================================
@@ -1232,6 +1414,9 @@ def main():
         'transaction_cost': 0.001,
         'risk_level': 'neutral',
         
+        # Periodic backtest
+        'backtest_freq': 10,  # Run backtest every N epochs
+        
         # Checkpoints
         'checkpoint_dir': './checkpoints'
     }
@@ -1253,9 +1438,17 @@ def main():
     logger.info("\nPreprocessing data...")
     df = preprocess_data(df, aligner)
     
+    # Validate data after preprocessing
+    validate_data(df, stage="After Preprocessing")
+    
     # Split data
     logger.info("\nSplitting data...")
     train_df, val_df, test_df = train_test_split_ts(df)
+    
+    # Validate splits
+    validate_data(train_df, stage="Training Set")
+    validate_data(val_df, stage="Validation Set")
+    validate_data(test_df, stage="Test Set")
     
     # Initialize trainer
     trainer = OrionTrainer(config)

@@ -306,36 +306,36 @@ class VariableSelectionNetwork(nn.Module):
         """
         # Handle both 3D and 4D input
         if x.dim() == 3:
-            # (B, F, D) → (B, 1, F, D)
+            # (B, num_f, D) → (B, 1, num_f, D)
             x = x.unsqueeze(1)
             squeeze_time = True
         else:
             squeeze_time = False
         
-        B, T, F, D = x.shape
+        B, T, num_f, D = x.shape  # Note: use num_f to avoid shadowing F (torch.nn.functional)
         
         # Transform each feature through its GRN
         # List of (B, T, hidden_dim) tensors
         transformed = []
-        for i in range(F):
+        for i in range(num_f):
             # x[:, :, i, :] has shape (B, T, D)
             feat_transformed = self.feature_grns[i](x[:, :, i, :], context)
             transformed.append(feat_transformed)
         
-        # Stack transformed features: (B, T, F, hidden_dim)
+        # Stack transformed features: (B, T, num_f, hidden_dim)
         transformed_stack = torch.stack(transformed, dim=2)
         
         # Compute variable weights
-        # Flatten input features: (B, T, F*D)
+        # Flatten input features: (B, T, num_f*D)
         flat_x = x.view(B, T, -1)
         
-        # Get weights: (B, T, F)
+        # Get weights: (B, T, num_f)
         weights = self.weight_grn(flat_x, context)
         weights = F.softmax(weights, dim=-1)
         
         # Weighted sum: (B, T, hidden_dim)
-        # weights: (B, T, F) → (B, T, F, 1)
-        # transformed: (B, T, F, hidden_dim)
+        # weights: (B, T, num_f) → (B, T, num_f, 1)
+        # transformed: (B, T, num_f, hidden_dim)
         output = (weights.unsqueeze(-1) * transformed_stack).sum(dim=2)
         
         if squeeze_time:
