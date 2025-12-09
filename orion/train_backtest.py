@@ -1257,6 +1257,24 @@ def validate_data(df: pd.DataFrame, stage: str = "unknown") -> bool:
     
     if abs(max_val) > 1000 or abs(min_val) > 1000:
         logger.warning(f"⚠ Large values detected. Consider checking normalization.")
+        # Diagnose which columns have the largest magnitudes (helpful to find volume/cvd)
+        abs_max_per_col = df.abs().max()
+        large_cols = abs_max_per_col[abs_max_per_col > 1000].sort_values(ascending=False)
+        if len(large_cols) > 0:
+            logger.warning("Top columns by absolute magnitude:")
+            for col, val in large_cols.head(10).items():
+                logger.warning(f"  {col}: max_abs={val:.4f}, min={df[col].min():.4f}, max={df[col].max():.4f}")
+            # Suggest common fixes when large values are found
+            logger.warning("Consider applying log1p to strictly positive features like volume, or Winsorize/clip outliers.")
+        # Also report which column contains the overall min/max values
+        try:
+            min_col = df.min().idxmin()
+            max_col = df.max().idxmax()
+            logger.info(f"Column with min value: {min_col} ({df[min_col].min():.4f})")
+            logger.info(f"Column with max value: {max_col} ({df[max_col].max():.4f})")
+        except Exception:
+            # If for some reason index operations fail, we skip
+            pass
     
     # Check for constant columns (zero variance)
     std = df.std()
@@ -1269,6 +1287,12 @@ def validate_data(df: pd.DataFrame, stage: str = "unknown") -> bool:
     sample_cols = df.columns[:5].tolist()
     for col in sample_cols:
         logger.info(f"  {col}: mean={df[col].mean():.4f}, std={df[col].std():.4f}")
+    
+    # Extra diagnostics: show top-3 columns by std (helps find very noisy features)
+    std_sorted = df.std().sort_values(ascending=False)
+    logger.info("Top 3 features by std deviation:")
+    for col, s in std_sorted.head(3).items():
+        logger.info(f"  {col}: std={s:.4f} (min={df[col].min():.4f}, max={df[col].max():.4f})")
     
     # Report issues
     if issues:
