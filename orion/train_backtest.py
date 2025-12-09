@@ -350,14 +350,35 @@ class TradingEnvironment:
         self.max_position = max_position
         
         # Extract close prices for reward calculation
-        # Find the 5m close column (base timeframe)
-        close_col = [c for c in data.columns if 'close_5m' in c.lower()]
-        if close_col:
-            self.prices = data[close_col[0]].values
+        # CRITICAL: Use raw prices, NOT FFD-transformed values!
+        # FFD values are stationary and don't represent actual prices
+        raw_close_col = [c for c in data.columns if '_raw_close_5m' in c.lower()]
+        if raw_close_col:
+            self.prices = data[raw_close_col[0]].values
+            logger.info(f"TradingEnvironment using raw close prices from '{raw_close_col[0]}'")
         else:
-            # Fallback: use first 'close' column
-            close_cols = [c for c in data.columns if 'close' in c.lower()]
-            self.prices = data[close_cols[0]].values if close_cols else data.iloc[:, 3].values
+            # Fallback: Try to find close_5m (may be FFD-transformed - will warn)
+            close_col = [c for c in data.columns if 'close_5m' in c.lower()]
+            if close_col:
+                self.prices = data[close_col[0]].values
+                logger.warning(f"Using '{close_col[0]}' for prices - may be FFD-transformed!")
+            else:
+                # Last fallback
+                close_cols = [c for c in data.columns if 'close' in c.lower()]
+                self.prices = data[close_cols[0]].values if close_cols else data.iloc[:, 3].values
+                logger.warning("Using fallback close column for prices")
+        
+        # === SANITY CHECK: Verify prices look like actual BTC prices ===
+        price_min, price_max = self.prices.min(), self.prices.max()
+        price_mean = self.prices.mean()
+        logger.info(f"Price sanity check: min=${price_min:.2f}, max=${price_max:.2f}, mean=${price_mean:.2f}")
+        
+        if price_max < 100 or price_min < 0:
+            logger.error(f"⚠ PRICE ANOMALY DETECTED! Prices don't look like BTC/USD.")
+            logger.error(f"  This likely means FFD-transformed or normalized values are being used.")
+            logger.error(f"  Expected: $10,000 - $100,000 range for BTC")
+            logger.error(f"  Got: ${price_min:.4f} - ${price_max:.4f}")
+            # Don't raise - allow training to continue but warn heavily
         
         # Feature matrix
         self.features = data.values.astype(np.float32)
@@ -1430,14 +1451,30 @@ def preprocess_data(
     
     logger.info("Applying Fractional Differencing...")
     
+    # === CRITICAL: Preserve raw close prices for trading PnL calculation ===
+    # FFD transforms prices to stationary values, but we need actual prices for trading
+    raw_close_col = [c for c in df.columns if 'close_5m' in c.lower()]
+    if raw_close_col:
+        # Store raw close prices (will be normalized but NOT FFD-transformed)
+        df['_raw_close_5m'] = df[raw_close_col[0]].copy()
+        logger.info(f"Preserved raw close prices in '_raw_close_5m' for PnL calculation")
+    
     # Identify OHLCV columns (need FFD)
     ohlcv_cols = [c for c in df.columns if any(
         x in c.lower() for x in ['open', 'high', 'low', 'close', 'volume']
-    ) and not any(y in c.lower() for y in ['ema', 'rsi', 'atr', 'bb', 'adx', 'vwap', 'cvd', 'ichimoku', 'tsi'])]
+    ) and not any(y in c.lower() for y in ['ema', 'rsi', 'atr', 'bb', 'adx', 'vwap', 'cvd', 'ichimoku', 'tsi', '_raw_'])]
     
     # Apply FFD to OHLCV columns
     ffd = FastFractionalDiff(d_step=0.05, significance=0.05)
     d_values = {}
+    
+    # === Apply log1p to volume columns first (handles extreme values) ===
+    volume_cols = [c for c in ohlcv_cols if 'volume' in c.lower()]
+    for vol_col in volume_cols:
+        # Volume is always positive, log1p handles zeros gracefully
+        df[vol_col] = np.log1p(df[vol_col].clip(lower=0))
+    if volume_cols:
+        logger.info(f"Applied log1p to {len(volume_cols)} volume columns")
     
     if ohlcv_cols:
         df_ohlcv = df[ohlcv_cols]
@@ -1459,9 +1496,21 @@ def preprocess_data(
     df = df.dropna()
     logger.info(f"Dropped {initial_len - len(df)} rows (FFD warm-up)")
     
-    # Normalize
+    # === CRITICAL: Save truly raw prices BEFORE normalization ===
+    # The _raw_close_5m column was saved before FFD, but normalization will change it
+    # We need actual dollar prices for PnL calculation
+    raw_prices_backup = None
+    if '_raw_close_5m' in df.columns:
+        raw_prices_backup = df['_raw_close_5m'].copy()
+    
+    # Normalize (this will scale _raw_close_5m too, but we'll restore it)
     logger.info("Applying RobustScaler normalization...")
     df = aligner.normalize(df, fit=True)
+    
+    # === Restore truly raw prices (not normalized, not FFD) for trading ===
+    if raw_prices_backup is not None:
+        df['_raw_close_5m'] = raw_prices_backup
+        logger.info("Restored raw close prices (bypassed normalization for PnL accuracy)")
     
     # Save to cache
     if use_cache:
@@ -1514,20 +1563,20 @@ def main():
         'years_of_history': 5,
         'cache_dir': './data_cache',
         
-        # Model
-        'hidden_dim': 128,
-        'num_heads': 4,
+        # Model - larger for RTX 4090
+        'hidden_dim': 256,      # Increased from 128
+        'num_heads': 8,         # Increased from 4
         'num_lstm_layers': 2,
         'num_quantiles': 51,
         'lookback': 96,  # 8 hours at 5m
         'dropout': 0.1,
         
-        # Training
+        # Training - optimized for RTX 4090 (24GB VRAM)
         'num_epochs': 100,
-        'batch_size': 256,
+        'batch_size': 1024,     # Increased from 256 - RTX 4090 can handle this
         'steps_per_epoch': 1000,
         'updates_per_step': 4,
-        'lr': 1e-4,
+        'lr': 3e-4,             # Slightly higher LR for larger batch
         'weight_decay': 1e-5,
         'gamma': 0.99,
         'max_grad_norm': 1.0,
