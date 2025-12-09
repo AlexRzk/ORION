@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # Local imports
@@ -774,7 +774,7 @@ class OrionTrainer:
         )
         
         # Mixed precision scaler (updated API for torch 2.x)
-        self.scaler = GradScaler('cuda')
+        self.scaler = GradScaler(device='cuda')
         
         # Replay buffer
         self.replay_buffer = ReplayBuffer(
@@ -893,7 +893,7 @@ class OrionTrainer:
         )
         
         # Mixed precision forward pass
-        with autocast():
+        with autocast(device_type='cuda'):
             loss = self.model.compute_loss(
                 states, actions, rewards, next_states, dones,
                 gamma=self.config.get('gamma', 0.99),
@@ -1283,20 +1283,127 @@ def validate_data(df: pd.DataFrame, stage: str = "unknown") -> bool:
 # ==============================================================================
 # DATA PREPROCESSING PIPELINE
 # ==============================================================================
+def get_preprocessed_cache_path(cache_dir: str, years: int) -> Path:
+    """Get the path for cached preprocessed data."""
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path / f"preprocessed_{years}y.parquet"
+
+
+def save_preprocessed_data(df: pd.DataFrame, cache_path: Path, d_values: dict = None) -> None:
+    """
+    Save preprocessed data to disk.
+    
+    Args:
+        df: Preprocessed DataFrame
+        cache_path: Path to save the data
+        d_values: FFD d values for each column (for logging on reload)
+    """
+    df.to_parquet(cache_path, engine='pyarrow', compression='snappy')
+    
+    # Save metadata (FFD d values, timestamp, etc.)
+    meta_path = cache_path.with_suffix('.json')
+    metadata = {
+        'created': datetime.now().isoformat(),
+        'shape': list(df.shape),
+        'columns': list(df.columns),
+        'd_values': d_values or {},
+        'index_start': str(df.index[0]) if len(df) > 0 else None,
+        'index_end': str(df.index[-1]) if len(df) > 0 else None,
+    }
+    with open(meta_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(f"✓ Saved preprocessed data to {cache_path}")
+    logger.info(f"  Shape: {df.shape}, Size: {cache_path.stat().st_size / 1024 / 1024:.2f} MB")
+
+
+def load_preprocessed_data(cache_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Load preprocessed data from cache if it exists and is valid.
+    
+    Args:
+        cache_path: Path to the cached data
+        
+    Returns:
+        DataFrame if cache exists and is valid, None otherwise
+    """
+    if not cache_path.exists():
+        return None
+    
+    meta_path = cache_path.with_suffix('.json')
+    if not meta_path.exists():
+        logger.warning(f"Cache metadata missing: {meta_path}")
+        return None
+    
+    try:
+        # Load metadata
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Check cache age (invalidate if older than 24 hours)
+        created = datetime.fromisoformat(metadata['created'])
+        age_hours = (datetime.now() - created).total_seconds() / 3600
+        
+        if age_hours > 24:
+            logger.info(f"Cache is {age_hours:.1f} hours old, will refresh")
+            return None
+        
+        # Load data
+        df = pd.read_parquet(cache_path)
+        
+        logger.info(f"✓ Loaded preprocessed data from cache")
+        logger.info(f"  Shape: {df.shape}")
+        logger.info(f"  Created: {metadata['created']}")
+        logger.info(f"  Date range: {metadata.get('index_start', 'N/A')} to {metadata.get('index_end', 'N/A')}")
+        
+        # Log FFD d values if available
+        if metadata.get('d_values'):
+            logger.info("  FFD d values used:")
+            for col, d in list(metadata['d_values'].items())[:5]:
+                logger.info(f"    {col}: d={d:.2f}")
+            if len(metadata['d_values']) > 5:
+                logger.info(f"    ... and {len(metadata['d_values']) - 5} more columns")
+        
+        return df
+        
+    except Exception as e:
+        logger.warning(f"Failed to load cache: {e}")
+        return None
+
+
 def preprocess_data(
     df: pd.DataFrame,
-    aligner: MultiTimeframeAligner
+    aligner: MultiTimeframeAligner,
+    cache_dir: str = './data_cache',
+    years: int = 5,
+    use_cache: bool = True
 ) -> pd.DataFrame:
     """
     Apply FFD and normalization to prepared data.
     
+    Caching behavior:
+    - Saves preprocessed data to disk after processing
+    - Loads from cache if available and < 24 hours old
+    - Cache is invalidated if 'years' parameter changes
+    
     Args:
         df: Aligned DataFrame with all features
         aligner: Fitted aligner (for normalization)
+        cache_dir: Directory for cache files
+        years: Years of data (used in cache filename)
+        use_cache: Whether to use caching
         
     Returns:
         Preprocessed DataFrame
     """
+    # Check cache first
+    if use_cache:
+        cache_path = get_preprocessed_cache_path(cache_dir, years)
+        cached_df = load_preprocessed_data(cache_path)
+        if cached_df is not None:
+            return cached_df
+    
     logger.info("Applying Fractional Differencing...")
     
     # Identify OHLCV columns (need FFD)
@@ -1306,6 +1413,7 @@ def preprocess_data(
     
     # Apply FFD to OHLCV columns
     ffd = FastFractionalDiff(d_step=0.05, significance=0.05)
+    d_values = {}
     
     if ohlcv_cols:
         df_ohlcv = df[ohlcv_cols]
@@ -1314,6 +1422,8 @@ def preprocess_data(
         # Replace original columns with FFD versions
         for col in ohlcv_cols:
             df[col] = df_ffd[col]
+        
+        d_values = ffd.d_values.copy()
         
         logger.info(f"FFD applied to {len(ohlcv_cols)} OHLCV columns")
         logger.info("Optimal d values:")
@@ -1328,6 +1438,11 @@ def preprocess_data(
     # Normalize
     logger.info("Applying RobustScaler normalization...")
     df = aligner.normalize(df, fit=True)
+    
+    # Save to cache
+    if use_cache:
+        cache_path = get_preprocessed_cache_path(cache_dir, years)
+        save_preprocessed_data(df, cache_path, d_values)
     
     return df
 
@@ -1434,9 +1549,15 @@ def main():
         use_cache=True
     )
     
-    # Preprocess (FFD + normalization)
+    # Preprocess (FFD + normalization) - uses caching
     logger.info("\nPreprocessing data...")
-    df = preprocess_data(df, aligner)
+    df = preprocess_data(
+        df, 
+        aligner,
+        cache_dir=config['cache_dir'],
+        years=config['years_of_history'],
+        use_cache=True
+    )
     
     # Validate data after preprocessing
     validate_data(df, stage="After Preprocessing")
