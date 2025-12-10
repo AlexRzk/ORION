@@ -1080,10 +1080,8 @@ class TFT_QR_DQN(nn.Module):
             # Get target quantiles
             target_quantiles, _ = target.forward(next_states)  # (B, A, N)
             
-            # Select best action (double DQN style)
-            # Use current network to select action
-            current_next_q, _ = self.forward(next_states)
-            next_q_values = self.qr_head.get_q_values(current_next_q, 'neutral')
+            # Select best action using mean Q-values from target network (standard DQN)
+            next_q_values = self.qr_head.get_q_values(target_quantiles, 'neutral')
             best_actions = next_q_values.argmax(dim=-1)  # (B,)
             
             # Get quantiles for best action from target network
