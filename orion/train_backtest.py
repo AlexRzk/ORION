@@ -1851,11 +1851,11 @@ def main():
         'lookback': 64,         # 5.3 hours at 5m (reduced from 96)
         'dropout': 0.1,
         
-        # Training - Optimized for speed (10GB VRAM usage leaves room)
+        # Training - Emergency fix: drastically reduced for debugging
         'num_epochs': 100,
         'batch_size': optimal_batch,  # Auto-detected based on GPU memory
-        'steps_per_epoch': 1500, # Ensures buffer > batch_size for training
-        'updates_per_step': 4,  # Balanced: enough training, not too slow
+        'steps_per_epoch': 500, # Reduced from 1500
+        'updates_per_step': 1,  # Reduced from 4 - CRITICAL FIX for slow training
         'lr': 3e-4,
         'weight_decay': 1e-5,
         'gamma': 0.99,
