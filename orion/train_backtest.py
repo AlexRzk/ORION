@@ -778,6 +778,10 @@ class OrionTrainer:
         num_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Model parameters: {num_params:,}")
         
+        # Verify GPU placement
+        first_param = next(self.model.parameters())
+        logger.info(f"Model device: {first_param.device} | dtype: {first_param.dtype}")
+        
         # Optimizer (Ranger or AdamW)
         use_ranger = self.config.get('use_ranger', True)
         lr = self.config.get('lr', 1e-4)
@@ -950,7 +954,7 @@ class OrionTrainer:
         
         # Gradient clipping (prevents exploding gradients)
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
             self.config.get('max_grad_norm', 1.0)
         )
