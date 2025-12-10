@@ -1216,8 +1216,10 @@ class OrionTrainer:
             # Skip training if buffer doesn't have enough samples
             min_samples_for_training = batch_size
             if len(self.replay_buffer) < min_samples_for_training:
-                logger.info(f"Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
+                logger.info(f"⚠️  Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
                 num_updates = 0
+            else:
+                logger.info(f"🎯 Starting training: {num_updates} gradient updates...")
             
             for update_idx in range(num_updates):
                 loss = self.train_step(batch_size)
@@ -1230,8 +1232,8 @@ class OrionTrainer:
                 if total_steps % target_update_freq == 0:
                     self._update_target_network()
                 
-                # Progress logging every 25%
-                if (update_idx + 1) % (num_updates // 4) == 0:
+                # Progress logging every 10%
+                if (update_idx + 1) % max(1, num_updates // 10) == 0:
                     progress_pct = (update_idx + 1) / num_updates * 100
                     avg_loss_so_far = np.mean(epoch_losses) if epoch_losses else 0
                     
@@ -1261,9 +1263,11 @@ class OrionTrainer:
             val_start = time.time()
             if epoch < 10:
                 # Skip validation in early epochs (model not trained yet)
+                logger.info("⏩ Skipping validation (first 10 epochs)")
                 val_metrics = {'sortino_ratio': 0.0, 'sharpe_ratio': 0.0}
                 val_time = 0.0
             else:
+                logger.info("📊 Running validation...")
                 val_metrics = self.validate()
                 val_time = time.time() - val_start
             
