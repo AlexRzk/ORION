@@ -862,7 +862,8 @@ class OrionTrainer:
     def collect_experience(
         self,
         num_steps: int,
-        epsilon: float = 0.1
+        epsilon: float = 0.1,
+        show_progress: bool = True
     ) -> Dict[str, float]:
         """
         Collect experience by interacting with environment.
@@ -870,6 +871,7 @@ class OrionTrainer:
         Args:
             num_steps: Number of environment steps
             epsilon: Exploration rate
+            show_progress: Whether to show progress bar
             
         Returns:
             Statistics from collection
@@ -878,7 +880,17 @@ class OrionTrainer:
         total_reward = 0
         episode_rewards = []
         
+        collection_start = time.time()
         for step in range(num_steps):
+            # Progress updates every 10%
+            if show_progress and step > 0 and step % max(1, num_steps // 10) == 0:
+                pct = step / num_steps * 100
+                elapsed = time.time() - collection_start
+                eta = (elapsed / step) * (num_steps - step)
+                logger.info(
+                    f"  Collecting data: [{pct:3.0f}%] {step}/{num_steps} steps | "
+                    f"ETA: {int(eta)}s | Buffer: {len(self.replay_buffer)}"
+                )
             # Select action
             state_tensor = state.unsqueeze(0).to(self.device)
             action, _ = self.model.select_action(
@@ -1163,15 +1175,20 @@ class OrionTrainer:
         logger.info(f"Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
         logger.info(f"Device: {self.device}")
         
-        # GPU info
+        # GPU info with memory usage
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+            gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            gpu_mem_used = torch.cuda.memory_allocated() / 1024**3
+            gpu_mem_pct = gpu_mem_used / gpu_mem_total * 100
+            logger.info(f"GPU: {gpu_name} ({gpu_mem_total:.1f} GB)")
+            logger.info(f"GPU Memory: {gpu_mem_used:.1f}/{gpu_mem_total:.1f} GB ({gpu_mem_pct:.1f}%) - Model loaded")
         
         logger.info("=" * 60)
         logger.info("STARTING TRAINING")
         logger.info("=" * 60)
+        logger.info("")
+        logger.info("⏳ Epoch 1 starting... (this may take 2-3 minutes)")
         
         for epoch in range(num_epochs):
             epoch_start = time.time()
@@ -1180,11 +1197,13 @@ class OrionTrainer:
             # ================================================================
             # PHASE 1: Experience Collection
             # ================================================================
+            logger.info(f"EPOCH {epoch+1}/{num_epochs} - Collecting {steps_per_epoch} steps...")
             self.model.train()
             collect_start = time.time()
             collection_stats = self.collect_experience(
                 steps_per_epoch,
-                epsilon=epsilon
+                epsilon=epsilon,
+                show_progress=True
             )
             collect_time = time.time() - collect_start
             
@@ -1783,8 +1802,32 @@ def train_test_split_ts(
 # ==============================================================================
 # MAIN ENTRY POINT
 # ==============================================================================
+def get_optimal_batch_size() -> int:
+    """
+    Determine optimal batch size based on available GPU memory.
+    Targets 80-90% GPU memory utilization.
+    """
+    if not torch.cuda.is_available():
+        return 256
+    
+    # Get total GPU memory
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    
+    # Rough estimate: batch_size scales with available memory
+    # RTX 4090 (24GB) -> 512, RTX 3090 (24GB) -> 512, RTX 3080 (10GB) -> 256
+    if total_mem_gb >= 20:
+        return 512
+    elif total_mem_gb >= 12:
+        return 384
+    else:
+        return 256
+
+
 def main():
     """Main training pipeline."""
+    
+    # Auto-detect optimal batch size
+    optimal_batch = get_optimal_batch_size()
     
     # Configuration
     config = {
@@ -1802,7 +1845,7 @@ def main():
         
         # Training - Optimized for speed (10GB VRAM usage leaves room)
         'num_epochs': 100,
-        'batch_size': 512,      # Increased for better GPU utilization
+        'batch_size': optimal_batch,  # Auto-detected based on GPU memory
         'steps_per_epoch': 1000, # Reduced to speed up collection phase
         'updates_per_step': 8,  # More GPU work per collected step
         'lr': 3e-4,
