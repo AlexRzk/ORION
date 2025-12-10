@@ -1219,8 +1219,10 @@ class OrionTrainer:
                 logger.info(f"⚠️  Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
                 num_updates = 0
             else:
-                logger.info(f"🎯 Starting training: {num_updates} gradient updates (ETA: ~{int(num_updates * 0.003)}s)...")
+                estimated_time = int(num_updates * 0.006)  # More realistic: 6ms per update
+                logger.info(f"🎯 Starting training: {num_updates} gradient updates (ETA: ~{estimated_time}s)...")
             
+            update_interval = max(1, num_updates // 20)  # 5% intervals
             for update_idx in range(num_updates):
                 loss = self.train_step(batch_size)
                 if loss > 0:  # Only track non-zero losses
@@ -1232,8 +1234,10 @@ class OrionTrainer:
                 if total_steps % target_update_freq == 0:
                     self._update_target_network()
                 
-                # Progress logging every 5% (more frequent feedback)
-                if (update_idx + 1) % max(1, num_updates // 20) == 0:
+                # Progress logging: first update immediately, then every 5%
+                is_first_update = update_idx == 0
+                is_progress_point = (update_idx + 1) % update_interval == 0
+                if is_first_update or is_progress_point:
                     progress_pct = (update_idx + 1) / num_updates * 100
                     avg_loss_so_far = np.mean(epoch_losses) if epoch_losses else 0
                     
@@ -1851,7 +1855,7 @@ def main():
         'num_epochs': 100,
         'batch_size': optimal_batch,  # Auto-detected based on GPU memory
         'steps_per_epoch': 1500, # Ensures buffer > batch_size for training
-        'updates_per_step': 8,  # More GPU work per collected step
+        'updates_per_step': 4,  # Balanced: enough training, not too slow
         'lr': 3e-4,
         'weight_decay': 1e-5,
         'gamma': 0.99,
