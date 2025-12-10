@@ -291,18 +291,18 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('ORION.QuickTest')
 
-# Quick test config - optimized for RTX 4090
+# Quick test config - Memory-efficient
 config = {
     'years_of_history': 1,  # Less data for quick test
     'cache_dir': './data_cache',
-    'hidden_dim': 256,      # Large for RTX 4090
-    'num_heads': 8,
+    'hidden_dim': 128,      # Reduced for stability
+    'num_heads': 4,
     'num_lstm_layers': 2,
-    'num_quantiles': 51,
+    'num_quantiles': 25,
     'lookback': 48,
     'dropout': 0.1,
     'num_epochs': 5,  # Quick test
-    'batch_size': 512,      # Reduced to prevent OOM
+    'batch_size': 256,
     'steps_per_epoch': 1000,
     'updates_per_step': 4,
     'lr': 3e-4,

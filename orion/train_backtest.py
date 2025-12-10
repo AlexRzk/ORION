@@ -52,6 +52,9 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
+# Enable CUDA memory optimization to reduce fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 # Local imports
 from orion.data.loader import OrionDataLoader, MultiTimeframeAligner, load_and_prepare_data
 from orion.math.fracdiff import FastFractionalDiff
@@ -1779,18 +1782,18 @@ def main():
         'years_of_history': 5,
         'cache_dir': './data_cache',
         
-        # Model - larger for RTX 4090
-        'hidden_dim': 256,      # Increased from 128
-        'num_heads': 8,         # Increased from 4
+        # Model - Reduced for memory efficiency
+        'hidden_dim': 128,      # Reduced from 256
+        'num_heads': 4,         # Reduced from 8
         'num_lstm_layers': 2,
-        'num_quantiles': 51,
-        'lookback': 96,  # 8 hours at 5m
+        'num_quantiles': 25,    # Reduced from 51
+        'lookback': 64,         # 5.3 hours at 5m (reduced from 96)
         'dropout': 0.1,
         
-        # Training - Optimized for RTX 4090 (24GB VRAM)
+        # Training - Conservative settings for memory stability
         'num_epochs': 100,
-        'batch_size': 512,      # Reduced to prevent OOM with large model
-        'steps_per_epoch': 2000, # Steps to collect per epoch
+        'batch_size': 256,      # Further reduced to ensure stability
+        'steps_per_epoch': 3000, # More steps to compensate for smaller batch
         'updates_per_step': 4,  # Gradient updates per collected step
         'lr': 3e-4,             # Higher LR for larger batch
         'weight_decay': 1e-5,
