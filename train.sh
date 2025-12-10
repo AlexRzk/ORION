@@ -204,17 +204,17 @@ logger = logging.getLogger('ORION.QuickTest')
 config = {
     'years_of_history': 1,
     'cache_dir': './data_cache',
-    'hidden_dim': 128,       # Increased for better GPU usage
-    'num_heads': 4,          # Increased
-    'num_lstm_layers': 1,
+    'hidden_dim': 256,       # Large for RTX 4090
+    'num_heads': 8,
+    'num_lstm_layers': 2,
     'num_quantiles': 51,
     'lookback': 48,
     'dropout': 0.1,
     'num_epochs': 5,
-    'batch_size': 512,       # Increased from 128 for RTX 4090
-    'steps_per_epoch': 200,  # More steps per epoch
-    'updates_per_step': 4,   # More updates per step
-    'lr': 2e-4,
+    'batch_size': 1024,      # Large batch for RTX 4090
+    'steps_per_epoch': 300,
+    'updates_per_step': 8,
+    'lr': 3e-4,
     'weight_decay': 1e-5,
     'gamma': 0.99,
     'max_grad_norm': 1.0,
@@ -225,7 +225,7 @@ config = {
     'initial_epsilon': 1.0,
     'final_epsilon': 0.1,
     'epsilon_decay': 0.9,
-    'buffer_size': 50_000,   # Increased buffer
+    'buffer_size': 100_000,
     'target_update_freq': 50,
     'transaction_cost': 0.001,
     'risk_level': 'neutral',
@@ -295,17 +295,17 @@ logger = logging.getLogger('ORION.QuickTest')
 config = {
     'years_of_history': 1,  # Less data for quick test
     'cache_dir': './data_cache',
-    'hidden_dim': 128,      # Increased for GPU usage
-    'num_heads': 4,
-    'num_lstm_layers': 1,
+    'hidden_dim': 256,      # Large for RTX 4090
+    'num_heads': 8,
+    'num_lstm_layers': 2,
     'num_quantiles': 51,
     'lookback': 48,
     'dropout': 0.1,
     'num_epochs': 5,  # Quick test
-    'batch_size': 512,      # Increased for RTX 4090
-    'steps_per_epoch': 200,
-    'updates_per_step': 4,
-    'lr': 2e-4,
+    'batch_size': 1024,     # Large batch for RTX 4090
+    'steps_per_epoch': 300,
+    'updates_per_step': 8,
+    'lr': 3e-4,
     'weight_decay': 1e-5,
     'gamma': 0.99,
     'max_grad_norm': 1.0,
@@ -316,7 +316,7 @@ config = {
     'initial_epsilon': 1.0,
     'final_epsilon': 0.1,
     'epsilon_decay': 0.9,
-    'buffer_size': 50_000,
+    'buffer_size': 100_000,
     'target_update_freq': 50,
     'transaction_cost': 0.001,
     'risk_level': 'neutral',

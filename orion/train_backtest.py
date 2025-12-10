@@ -977,14 +977,21 @@ class OrionTrainer:
         Returns:
             Test performance metrics
         """
-        logger.info(f"\n{'='*40}")
-        logger.info(f"PERIODIC BACKTEST (Epoch {epoch+1})")
-        logger.info(f"{'='*40}")
+        backtest_start = time.time()
+        
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"PERIODIC BACKTEST - Epoch {epoch+1}")
+        logger.info("=" * 60)
         
         self.model.eval()
         
         state = self.test_env.reset()
         done = False
+        actions_taken = []
+        
+        # Track starting balance for PnL
+        initial_balance = self.test_env.initial_balance
         
         with torch.no_grad():
             while not done:
@@ -994,14 +1001,67 @@ class OrionTrainer:
                     risk_level=self.config.get('risk_level', 'neutral'),
                     epsilon=0.0
                 )
-                state, reward, done, info = self.test_env.step(action.item())
+                action_val = action.item()
+                actions_taken.append(action_val)
+                state, reward, done, info = self.test_env.step(action_val)
+        
+        backtest_time = time.time() - backtest_start
         
         metrics = self.test_env.get_performance_metrics()
         
-        logger.info(f"Test Return: {metrics.get('total_return', 0)*100:.2f}%")
-        logger.info(f"Test Sortino: {metrics.get('sortino_ratio', 0):.4f}")
-        logger.info(f"Test Sharpe: {metrics.get('sharpe_ratio', 0):.4f}")
-        logger.info(f"Num Trades: {metrics.get('num_trades', 0)}")
+        # Calculate PnL in dollars (assuming $10k starting capital)
+        total_return = metrics.get('total_return', 0)
+        final_balance = initial_balance * (1 + total_return)
+        pnl_dollars = final_balance - initial_balance
+        
+        # Action distribution
+        from collections import Counter
+        action_counts = Counter(actions_taken)
+        action_names = ['Long', 'Short', 'Hold', 'Close']
+        
+        # Trade analysis
+        trades = self.test_env.trades
+        if trades:
+            winning_trades = [t for t in trades if t['pnl'] > 0]
+            losing_trades = [t for t in trades if t['pnl'] <= 0]
+            avg_win = np.mean([t['pnl'] for t in winning_trades]) if winning_trades else 0
+            avg_loss = np.mean([t['pnl'] for t in losing_trades]) if losing_trades else 0
+        else:
+            winning_trades = []
+            losing_trades = []
+            avg_win = 0
+            avg_loss = 0
+        
+        # Output detailed results
+        logger.info(f"Duration: {backtest_time:.1f}s | Steps: {len(actions_taken):,}")
+        logger.info("-" * 40)
+        logger.info("PERFORMANCE METRICS:")
+        logger.info(f"  Return:        {total_return*100:+.2f}%")
+        logger.info(f"  PnL:           ${pnl_dollars:+,.2f} (from ${initial_balance:,.0f})")
+        logger.info(f"  Final Balance: ${final_balance:,.2f}")
+        logger.info(f"  Sortino:       {metrics.get('sortino_ratio', 0):.4f}")
+        logger.info(f"  Sharpe:        {metrics.get('sharpe_ratio', 0):.4f}")
+        logger.info(f"  Max Drawdown:  {metrics.get('max_drawdown', 0)*100:.2f}%")
+        logger.info("-" * 40)
+        logger.info("TRADE STATISTICS:")
+        logger.info(f"  Total Trades:  {len(trades)}")
+        if trades:
+            logger.info(f"  Winning:       {len(winning_trades)} ({len(winning_trades)/len(trades)*100:.1f}%)")
+            logger.info(f"  Losing:        {len(losing_trades)} ({len(losing_trades)/len(trades)*100:.1f}%)")
+        else:
+            logger.info(f"  Winning:       0")
+            logger.info(f"  Losing:        0")
+        logger.info(f"  Avg Win:       {avg_win*100:+.2f}%")
+        logger.info(f"  Avg Loss:      {avg_loss*100:+.2f}%")
+        logger.info(f"  Profit Factor: {metrics.get('profit_factor', 0):.2f}")
+        logger.info("-" * 40)
+        logger.info("ACTION DISTRIBUTION:")
+        for i, name in enumerate(action_names):
+            count = action_counts.get(i, 0)
+            pct = count / len(actions_taken) * 100 if actions_taken else 0
+            bar = '█' * int(pct / 5)  # Simple bar chart
+            logger.info(f"  {name:6s}: {count:5d} ({pct:5.1f}%) {bar}")
+        logger.info("=" * 60)
         
         self.model.train()
         return metrics
@@ -1045,7 +1105,7 @@ class OrionTrainer:
     
     def train(self) -> Dict[str, List[float]]:
         """
-        Main training loop.
+        Main training loop with detailed progress logging.
         
         Returns:
             Training history dictionary
@@ -1075,23 +1135,55 @@ class OrionTrainer:
         
         epsilon = initial_epsilon
         total_steps = 0
+        training_start = time.time()
         
-        logger.info(f"Starting training for {num_epochs} epochs")
-        logger.info(f"Batch size: {batch_size}, Steps/epoch: {steps_per_epoch}")
+        # Calculate total updates for progress tracking
+        total_updates = num_epochs * steps_per_epoch * updates_per_step
+        
+        logger.info("=" * 60)
+        logger.info("TRAINING CONFIGURATION")
+        logger.info("=" * 60)
+        logger.info(f"Epochs: {num_epochs}")
+        logger.info(f"Steps/epoch: {steps_per_epoch}")
+        logger.info(f"Batch size: {batch_size}")
+        logger.info(f"Updates/step: {updates_per_step}")
+        logger.info(f"Total gradient updates: {total_updates:,}")
+        logger.info(f"Replay buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
+        logger.info(f"Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+        logger.info(f"Device: {self.device}")
+        
+        # GPU info
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+        
+        logger.info("=" * 60)
+        logger.info("STARTING TRAINING")
+        logger.info("=" * 60)
         
         for epoch in range(num_epochs):
             epoch_start = time.time()
             epoch_losses = []
             
-            # Collect experience
+            # ================================================================
+            # PHASE 1: Experience Collection
+            # ================================================================
             self.model.train()
+            collect_start = time.time()
             collection_stats = self.collect_experience(
                 steps_per_epoch,
                 epsilon=epsilon
             )
+            collect_time = time.time() - collect_start
             
-            # Training updates
-            for _ in range(steps_per_epoch * updates_per_step):
+            # ================================================================
+            # PHASE 2: Training Updates with Progress
+            # ================================================================
+            update_start = time.time()
+            num_updates = steps_per_epoch * updates_per_step
+            
+            for update_idx in range(num_updates):
                 loss = self.train_step(batch_size)
                 epoch_losses.append(loss)
                 
@@ -1100,15 +1192,38 @@ class OrionTrainer:
                 # Update target network
                 if total_steps % target_update_freq == 0:
                     self._update_target_network()
+                
+                # Progress logging every 25%
+                if (update_idx + 1) % (num_updates // 4) == 0:
+                    progress_pct = (update_idx + 1) / num_updates * 100
+                    avg_loss_so_far = np.mean(epoch_losses) if epoch_losses else 0
+                    
+                    # GPU memory usage
+                    if torch.cuda.is_available():
+                        gpu_mem_used = torch.cuda.memory_allocated() / 1024**3
+                        gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                        gpu_pct = gpu_mem_used / gpu_mem_total * 100
+                        logger.info(
+                            f"  [{progress_pct:3.0f}%] Updates: {update_idx+1}/{num_updates} | "
+                            f"Loss: {avg_loss_so_far:.4f} | "
+                            f"GPU Mem: {gpu_mem_used:.1f}/{gpu_mem_total:.1f}GB ({gpu_pct:.0f}%)"
+                        )
+            
+            update_time = time.time() - update_start
             
             # Decay epsilon
             epsilon = max(final_epsilon, epsilon * epsilon_decay)
             
             # Scheduler step
             self.scheduler.step()
+            current_lr = self.optimizer.param_groups[0]['lr']
             
-            # Validation
+            # ================================================================
+            # PHASE 3: Validation
+            # ================================================================
+            val_start = time.time()
             val_metrics = self.validate()
+            val_time = time.time() - val_start
             
             # Record history
             avg_loss = np.mean(epoch_losses) if epoch_losses else 0
@@ -1145,35 +1260,68 @@ class OrionTrainer:
                 history['test_return'].append(float('nan'))
                 history['test_sortino'].append(float('nan'))
             
-            # Logging
+            # ================================================================
+            # EPOCH SUMMARY with timing breakdown
+            # ================================================================
             epoch_time = time.time() - epoch_start
+            elapsed_total = time.time() - training_start
+            epochs_remaining = num_epochs - epoch - 1
+            eta_seconds = (elapsed_total / (epoch + 1)) * epochs_remaining if epoch > 0 else 0
+            eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+            
+            logger.info("-" * 60)
             logger.info(
-                f"Epoch {epoch+1}/{num_epochs} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Val Sortino: {val_metrics.get('sortino_ratio', 0):.4f} | "
-                f"Val Sharpe: {val_metrics.get('sharpe_ratio', 0):.4f} | "
-                f"ε: {epsilon:.4f} | "
-                f"Time: {epoch_time:.1f}s"
+                f"EPOCH {epoch+1}/{num_epochs} COMPLETE | "
+                f"Time: {epoch_time:.1f}s | "
+                f"ETA: {eta_str}"
             )
+            logger.info(
+                f"  Loss: {avg_loss:.4f} | "
+                f"Val Sortino: {val_metrics.get('sortino_ratio', 0):.4f} | "
+                f"Val Sharpe: {val_metrics.get('sharpe_ratio', 0):.4f}"
+            )
+            logger.info(
+                f"  ε: {epsilon:.4f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Buffer: {len(self.replay_buffer):,}"
+            )
+            logger.info(
+                f"  Timing: Collect={collect_time:.1f}s, Train={update_time:.1f}s, Val={val_time:.1f}s"
+            )
+            logger.info("-" * 60)
+        
+        # Final summary
+        total_time = time.time() - training_start
+        logger.info("=" * 60)
+        logger.info("TRAINING COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"Total time: {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+        logger.info(f"Best validation Sortino: {max(history['val_sortino']):.4f}")
+        if self.best_test_epoch >= 0:
+            logger.info(f"Best test return: {self.best_test_return*100:.2f}% (epoch {self.best_test_epoch+1})")
         
         return history
     
     def backtest(self) -> Dict[str, float]:
         """
-        Final backtest on held-out test data.
+        Final backtest on held-out test data with comprehensive output.
         
         Loads the best model and runs a full episode on test data.
         
         Returns:
             Test performance metrics
         """
+        backtest_start = time.time()
+        
+        logger.info("")
         logger.info("=" * 60)
-        logger.info("BACKTEST ON HELD-OUT TEST DATA")
+        logger.info("FINAL BACKTEST ON HELD-OUT TEST DATA")
         logger.info("=" * 60)
         
         # Load best model
         try:
             self.saver.load_best(self.model, str(self.device))
+            logger.info("✓ Loaded best validation model")
         except FileNotFoundError:
             logger.warning("No saved model found, using current model")
         
@@ -1182,6 +1330,7 @@ class OrionTrainer:
         state = self.test_env.reset()
         done = False
         actions_taken = []
+        initial_balance = self.test_env.initial_balance
         
         with torch.no_grad():
             while not done:
@@ -1196,30 +1345,87 @@ class OrionTrainer:
                 
                 state, reward, done, info = self.test_env.step(action)
         
+        backtest_time = time.time() - backtest_start
+        
         # Compute metrics
         metrics = self.test_env.get_performance_metrics()
+        
+        # Calculate PnL
+        total_return = metrics.get('total_return', 0)
+        final_balance = initial_balance * (1 + total_return)
+        pnl_dollars = final_balance - initial_balance
         
         # Action distribution
         from collections import Counter
         action_counts = Counter(actions_taken)
         action_names = ['Long', 'Short', 'Hold', 'Close']
         
-        logger.info("\n" + "=" * 40)
-        logger.info("BACKTEST RESULTS")
-        logger.info("=" * 40)
-        logger.info(f"Total Return: {metrics.get('total_return', 0)*100:.2f}%")
-        logger.info(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 0):.4f}")
-        logger.info(f"Sortino Ratio: {metrics.get('sortino_ratio', 0):.4f}")
-        logger.info(f"Max Drawdown: {metrics.get('max_drawdown', 0)*100:.2f}%")
-        logger.info(f"Win Rate: {metrics.get('win_rate', 0)*100:.2f}%")
-        logger.info(f"Profit Factor: {metrics.get('profit_factor', 0):.2f}")
-        logger.info(f"Num Trades: {metrics.get('num_trades', 0)}")
+        # Trade analysis
+        trades = self.test_env.trades
+        if trades:
+            winning_trades = [t for t in trades if t['pnl'] > 0]
+            losing_trades = [t for t in trades if t['pnl'] <= 0]
+            avg_win = np.mean([t['pnl'] for t in winning_trades]) if winning_trades else 0
+            avg_loss = np.mean([t['pnl'] for t in losing_trades]) if losing_trades else 0
+            best_trade = max(t['pnl'] for t in trades)
+            worst_trade = min(t['pnl'] for t in trades)
+        else:
+            winning_trades = []
+            losing_trades = []
+            avg_win = avg_loss = best_trade = worst_trade = 0
         
-        logger.info("\nAction Distribution:")
+        # Price range info
+        prices = self.test_env.prices
+        price_start = prices[self.test_env.lookback] if len(prices) > self.test_env.lookback else prices[0]
+        price_end = prices[-1]
+        buy_hold_return = (price_end - price_start) / price_start
+        
+        logger.info(f"Duration: {backtest_time:.1f}s | Steps: {len(actions_taken):,}")
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("PERFORMANCE SUMMARY")
+        logger.info("=" * 40)
+        logger.info(f"  Strategy Return:   {total_return*100:+.2f}%")
+        logger.info(f"  Buy & Hold Return: {buy_hold_return*100:+.2f}%")
+        logger.info(f"  Alpha:             {(total_return - buy_hold_return)*100:+.2f}%")
+        logger.info("")
+        logger.info(f"  Starting Capital:  ${initial_balance:,.0f}")
+        logger.info(f"  Final Balance:     ${final_balance:,.2f}")
+        logger.info(f"  Net PnL:           ${pnl_dollars:+,.2f}")
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("RISK METRICS")
+        logger.info("=" * 40)
+        logger.info(f"  Sharpe Ratio:      {metrics.get('sharpe_ratio', 0):.4f}")
+        logger.info(f"  Sortino Ratio:     {metrics.get('sortino_ratio', 0):.4f}")
+        logger.info(f"  Max Drawdown:      {metrics.get('max_drawdown', 0)*100:.2f}%")
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("TRADE ANALYSIS")
+        logger.info("=" * 40)
+        logger.info(f"  Total Trades:      {len(trades)}")
+        logger.info(f"  Win Rate:          {metrics.get('win_rate', 0)*100:.1f}%")
+        logger.info(f"  Profit Factor:     {metrics.get('profit_factor', 0):.2f}")
+        if trades:
+            logger.info(f"  Winning Trades:    {len(winning_trades)}")
+            logger.info(f"  Losing Trades:     {len(losing_trades)}")
+            logger.info(f"  Avg Win:           {avg_win*100:+.2f}%")
+            logger.info(f"  Avg Loss:          {avg_loss*100:+.2f}%")
+            logger.info(f"  Best Trade:        {best_trade*100:+.2f}%")
+            logger.info(f"  Worst Trade:       {worst_trade*100:+.2f}%")
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("ACTION DISTRIBUTION")
+        logger.info("=" * 40)
         for i, name in enumerate(action_names):
             count = action_counts.get(i, 0)
-            pct = count / len(actions_taken) * 100
-            logger.info(f"  {name}: {count} ({pct:.1f}%)")
+            pct = count / len(actions_taken) * 100 if actions_taken else 0
+            bar = '█' * int(pct / 5)
+            logger.info(f"  {name:6s}: {count:6d} ({pct:5.1f}%) {bar}")
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("BACKTEST COMPLETE")
+        logger.info("=" * 60)
         
         return metrics
 
@@ -1571,12 +1777,12 @@ def main():
         'lookback': 96,  # 8 hours at 5m
         'dropout': 0.1,
         
-        # Training - optimized for RTX 4090 (24GB VRAM)
+        # Training - MAXIMIZED for RTX 4090 (24GB VRAM)
         'num_epochs': 100,
-        'batch_size': 1024,     # Increased from 256 - RTX 4090 can handle this
-        'steps_per_epoch': 1000,
-        'updates_per_step': 4,
-        'lr': 3e-4,             # Slightly higher LR for larger batch
+        'batch_size': 2048,     # Large batch for RTX 4090
+        'steps_per_epoch': 500, # More steps for better coverage
+        'updates_per_step': 8,  # More gradient updates per collected step
+        'lr': 3e-4,             # Higher LR for larger batch
         'weight_decay': 1e-5,
         'gamma': 0.99,
         'max_grad_norm': 1.0,
@@ -1592,8 +1798,8 @@ def main():
         'final_epsilon': 0.01,
         'epsilon_decay': 0.995,
         
-        # Replay buffer
-        'buffer_size': 100_000,
+        # Replay buffer - larger for diversity
+        'buffer_size': 200_000,
         
         # Target network
         'target_update_freq': 100,
