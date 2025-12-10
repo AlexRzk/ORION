@@ -302,9 +302,9 @@ config = {
     'lookback': 48,
     'dropout': 0.1,
     'num_epochs': 5,  # Quick test
-    'batch_size': 1024,     # Large batch for RTX 4090
-    'steps_per_epoch': 300,
-    'updates_per_step': 8,
+    'batch_size': 512,      # Reduced to prevent OOM
+    'steps_per_epoch': 1000,
+    'updates_per_step': 4,
     'lr': 3e-4,
     'weight_decay': 1e-5,
     'gamma': 0.99,

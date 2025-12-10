@@ -57,11 +57,14 @@ from orion.data.loader import OrionDataLoader, MultiTimeframeAligner, load_and_p
 from orion.math.fracdiff import FastFractionalDiff
 from orion.models.hybrid import TFT_QR_DQN, create_model
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
-)
+# Configure logger only if not already configured (prevents duplicate logs)
 logger = logging.getLogger("ORION.Train")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # Prevent duplicate logs from root logger
 
 
 # ==============================================================================
@@ -1183,9 +1186,16 @@ class OrionTrainer:
             update_start = time.time()
             num_updates = steps_per_epoch * updates_per_step
             
+            # Skip training if buffer doesn't have enough samples
+            min_samples_for_training = batch_size * 2
+            if len(self.replay_buffer) < min_samples_for_training:
+                logger.info(f"Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
+                num_updates = 0
+            
             for update_idx in range(num_updates):
                 loss = self.train_step(batch_size)
-                epoch_losses.append(loss)
+                if loss > 0:  # Only track non-zero losses
+                    epoch_losses.append(loss)
                 
                 total_steps += 1
                 
@@ -1777,11 +1787,11 @@ def main():
         'lookback': 96,  # 8 hours at 5m
         'dropout': 0.1,
         
-        # Training - MAXIMIZED for RTX 4090 (24GB VRAM)
+        # Training - Optimized for RTX 4090 (24GB VRAM)
         'num_epochs': 100,
-        'batch_size': 2048,     # Large batch for RTX 4090
-        'steps_per_epoch': 2000, # Increased to balance training vs validation time
-        'updates_per_step': 8,  # More gradient updates per collected step
+        'batch_size': 512,      # Reduced to prevent OOM with large model
+        'steps_per_epoch': 2000, # Steps to collect per epoch
+        'updates_per_step': 4,  # Gradient updates per collected step
         'lr': 3e-4,             # Higher LR for larger batch
         'weight_decay': 1e-5,
         'gamma': 0.99,
