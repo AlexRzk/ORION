@@ -1219,7 +1219,7 @@ class OrionTrainer:
                 logger.info(f"⚠️  Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
                 num_updates = 0
             else:
-                logger.info(f"🎯 Starting training: {num_updates} gradient updates...")
+                logger.info(f"🎯 Starting training: {num_updates} gradient updates (ETA: ~{int(num_updates * 0.003)}s)...")
             
             for update_idx in range(num_updates):
                 loss = self.train_step(batch_size)
@@ -1232,8 +1232,8 @@ class OrionTrainer:
                 if total_steps % target_update_freq == 0:
                     self._update_target_network()
                 
-                # Progress logging every 10%
-                if (update_idx + 1) % max(1, num_updates // 10) == 0:
+                # Progress logging every 5% (more frequent feedback)
+                if (update_idx + 1) % max(1, num_updates // 20) == 0:
                     progress_pct = (update_idx + 1) / num_updates * 100
                     avg_loss_so_far = np.mean(epoch_losses) if epoch_losses else 0
                     
