@@ -1214,7 +1214,7 @@ class OrionTrainer:
             num_updates = steps_per_epoch * updates_per_step
             
             # Skip training if buffer doesn't have enough samples
-            min_samples_for_training = batch_size * 2
+            min_samples_for_training = batch_size
             if len(self.replay_buffer) < min_samples_for_training:
                 logger.info(f"Buffer has {len(self.replay_buffer)} samples, need {min_samples_for_training}. Skipping training this epoch.")
                 num_updates = 0
@@ -1846,7 +1846,7 @@ def main():
         # Training - Optimized for speed (10GB VRAM usage leaves room)
         'num_epochs': 100,
         'batch_size': optimal_batch,  # Auto-detected based on GPU memory
-        'steps_per_epoch': 1000, # Reduced to speed up collection phase
+        'steps_per_epoch': 1500, # Ensures buffer > batch_size for training
         'updates_per_step': 8,  # More GPU work per collected step
         'lr': 3e-4,
         'weight_decay': 1e-5,
