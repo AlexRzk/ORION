@@ -1780,7 +1780,7 @@ def main():
         # Training - MAXIMIZED for RTX 4090 (24GB VRAM)
         'num_epochs': 100,
         'batch_size': 2048,     # Large batch for RTX 4090
-        'steps_per_epoch': 500, # More steps for better coverage
+        'steps_per_epoch': 2000, # Increased to balance training vs validation time
         'updates_per_step': 8,  # More gradient updates per collected step
         'lr': 3e-4,             # Higher LR for larger batch
         'weight_decay': 1e-5,
