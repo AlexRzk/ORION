@@ -60,6 +60,11 @@ from orion.data.loader import OrionDataLoader, MultiTimeframeAligner, load_and_p
 from orion.math.fracdiff import FastFractionalDiff
 from orion.models.hybrid import TFT_QR_DQN, create_model
 
+# Enable PyTorch performance optimizations
+torch.backends.cudnn.benchmark = True  # Auto-tune kernels for this input size
+torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster matmul on Ampere GPUs
+torch.backends.cudnn.allow_tf32 = True
+
 # Configure logger only if not already configured (prevents duplicate logs)
 logger = logging.getLogger("ORION.Train")
 if not logger.handlers:
@@ -1232,11 +1237,16 @@ class OrionTrainer:
             current_lr = self.optimizer.param_groups[0]['lr']
             
             # ================================================================
-            # PHASE 3: Validation
+            # PHASE 3: Validation (skip first 10 epochs for speed)
             # ================================================================
             val_start = time.time()
-            val_metrics = self.validate()
-            val_time = time.time() - val_start
+            if epoch < 10:
+                # Skip validation in early epochs (model not trained yet)
+                val_metrics = {'sortino_ratio': 0.0, 'sharpe_ratio': 0.0}
+                val_time = 0.0
+            else:
+                val_metrics = self.validate()
+                val_time = time.time() - val_start
             
             # Record history
             avg_loss = np.mean(epoch_losses) if epoch_losses else 0
@@ -1790,12 +1800,12 @@ def main():
         'lookback': 64,         # 5.3 hours at 5m (reduced from 96)
         'dropout': 0.1,
         
-        # Training - Conservative settings for memory stability
+        # Training - Optimized for speed (10GB VRAM usage leaves room)
         'num_epochs': 100,
-        'batch_size': 256,      # Further reduced to ensure stability
-        'steps_per_epoch': 3000, # More steps to compensate for smaller batch
-        'updates_per_step': 4,  # Gradient updates per collected step
-        'lr': 3e-4,             # Higher LR for larger batch
+        'batch_size': 512,      # Increased for better GPU utilization
+        'steps_per_epoch': 1000, # Reduced to speed up collection phase
+        'updates_per_step': 8,  # More GPU work per collected step
+        'lr': 3e-4,
         'weight_decay': 1e-5,
         'gamma': 0.99,
         'max_grad_norm': 1.0,
@@ -1822,7 +1832,7 @@ def main():
         'risk_level': 'neutral',
         
         # Periodic backtest
-        'backtest_freq': 10,  # Run backtest every N epochs
+        'backtest_freq': 20,  # Run backtest every N epochs (reduced for speed)
         
         # Checkpoints
         'checkpoint_dir': './checkpoints'
