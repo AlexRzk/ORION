@@ -305,14 +305,19 @@ class ReplayBuffer:
 
 
 # ==============================================================================
-# TRADING ENVIRONMENT
+# PROFESSIONAL TRADING ENVIRONMENT (BlackRock-Grade)
 # ==============================================================================
 class TradingEnvironment:
     """
-    RL Environment for Bitcoin trading.
+    Professional RL Environment for Bitcoin trading.
     
-    STATE:
-    Multi-timeframe features window (T timesteps × F features)
+    BLACKROCK-GRADE FEATURES:
+    1. Risk-adjusted rewards (Sortino-inspired)
+    2. Position management with stop-loss/take-profit
+    3. Drawdown penalties to prevent catastrophic losses
+    4. Action diversity incentives (anti-collapse)
+    5. Maximum holding period enforcement
+    6. Volatility-adjusted position sizing
     
     ACTION SPACE:
     0 = Long:  Enter long position (or hold if already long)
@@ -320,22 +325,14 @@ class TradingEnvironment:
     2 = Hold:  Maintain current position (no trade)
     3 = Close: Close any open position
     
-    REWARD:
-    PnL from the action, accounting for:
-    - Price change (main component)
-    - Transaction costs (spread + commission)
-    - Slippage (function of volatility)
+    REWARD FUNCTION (Multi-component):
+    R = R_pnl + R_risk + R_diversity + R_drawdown
     
-    MATH:
-    For going Long at price P_t:
-        Position = +1
-        Entry price = P_t * (1 + spread/2 + commission)
-    
-    For closing Long at price P_{t+k}:
-        Exit price = P_{t+k} * (1 - spread/2 - commission)
-        PnL = (Exit - Entry) / Entry
-    
-    Reward at each step = position * (P_t - P_{t-1}) / P_{t-1} - costs
+    Where:
+    - R_pnl: Realized/unrealized PnL
+    - R_risk: Penalty for excessive drawdown
+    - R_diversity: Bonus for action variety (prevents collapse)
+    - R_drawdown: Penalty for approaching stop-loss
     """
     
     def __init__(
@@ -343,8 +340,17 @@ class TradingEnvironment:
         data: pd.DataFrame,
         lookback: int = 96,
         initial_balance: float = 100_000.0,
-        transaction_cost: float = 0.001,  # 0.1% per trade (spread + commission)
-        max_position: float = 1.0
+        transaction_cost: float = 0.001,  # 0.1% per trade
+        max_position: float = 1.0,
+        # Risk Management Parameters
+        stop_loss_pct: float = 0.02,       # 2% stop loss per trade
+        take_profit_pct: float = 0.04,     # 4% take profit per trade
+        max_holding_steps: int = 288,       # Max 1 day (288 x 5min = 24h)
+        max_drawdown_pct: float = 0.10,    # 10% max portfolio drawdown
+        # Reward Shaping Parameters
+        drawdown_penalty_factor: float = 2.0,
+        inaction_penalty: float = 0.0001,  # Small penalty for doing nothing
+        diversity_bonus: float = 0.0005,   # Bonus for diverse actions
     ):
         """
         Args:
@@ -353,6 +359,13 @@ class TradingEnvironment:
             initial_balance: Starting capital
             transaction_cost: Cost per trade (fraction)
             max_position: Maximum position size (1 = 100% of capital)
+            stop_loss_pct: Auto-close position if loss exceeds this
+            take_profit_pct: Auto-close position if profit exceeds this
+            max_holding_steps: Force close after this many steps
+            max_drawdown_pct: Terminate episode if portfolio drawdown exceeds this
+            drawdown_penalty_factor: Multiplier for drawdown penalty
+            inaction_penalty: Penalty for holding flat with no position
+            diversity_bonus: Bonus for taking different actions
         """
         self.data = data
         self.lookback = lookback
@@ -360,59 +373,72 @@ class TradingEnvironment:
         self.transaction_cost = transaction_cost
         self.max_position = max_position
         
+        # Risk Management
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.max_holding_steps = max_holding_steps
+        self.max_drawdown_pct = max_drawdown_pct
+        
+        # Reward Shaping
+        self.drawdown_penalty_factor = drawdown_penalty_factor
+        self.inaction_penalty = inaction_penalty
+        self.diversity_bonus = diversity_bonus
+        
         # Extract close prices for reward calculation
-        # CRITICAL: Use raw prices, NOT FFD-transformed values!
-        # FFD values are stationary and don't represent actual prices
         raw_close_col = [c for c in data.columns if '_raw_close_5m' in c.lower()]
         if raw_close_col:
             self.prices = data[raw_close_col[0]].values
             logger.info(f"TradingEnvironment using raw close prices from '{raw_close_col[0]}'")
         else:
-            # Fallback: Try to find close_5m (may be FFD-transformed - will warn)
             close_col = [c for c in data.columns if 'close_5m' in c.lower()]
             if close_col:
                 self.prices = data[close_col[0]].values
                 logger.warning(f"Using '{close_col[0]}' for prices - may be FFD-transformed!")
             else:
-                # Last fallback
                 close_cols = [c for c in data.columns if 'close' in c.lower()]
                 self.prices = data[close_cols[0]].values if close_cols else data.iloc[:, 3].values
                 logger.warning("Using fallback close column for prices")
         
-        # === SANITY CHECK: Verify prices look like actual BTC prices ===
+        # Sanity check prices
         price_min, price_max = self.prices.min(), self.prices.max()
         price_mean = self.prices.mean()
         logger.info(f"Price sanity check: min=${price_min:.2f}, max=${price_max:.2f}, mean=${price_mean:.2f}")
         
         if price_max < 100 or price_min < 0:
             logger.error(f"⚠ PRICE ANOMALY DETECTED! Prices don't look like BTC/USD.")
-            logger.error(f"  This likely means FFD-transformed or normalized values are being used.")
-            logger.error(f"  Expected: $10,000 - $100,000 range for BTC")
-            logger.error(f"  Got: ${price_min:.4f} - ${price_max:.4f}")
-            # Don't raise - allow training to continue but warn heavily
         
         # Feature matrix
         self.features = data.values.astype(np.float32)
         
         # Episode tracking
         self.current_step = 0
-        self.position = 0  # -1, 0, or 1
+        self.position = 0
         self.entry_price = 0.0
+        self.entry_step = 0
         self.balance = initial_balance
+        self.peak_balance = initial_balance
         self.max_steps = len(data) - lookback
         
         # Performance tracking
         self.trades = []
         self.equity_curve = []
+        self.action_history = []  # Track recent actions for diversity
+        self.consecutive_same_action = 0
+        self.last_action = -1
     
     def reset(self) -> torch.Tensor:
         """Reset environment to start of episode."""
         self.current_step = self.lookback
         self.position = 0
         self.entry_price = 0.0
+        self.entry_step = 0
         self.balance = self.initial_balance
+        self.peak_balance = self.initial_balance
         self.trades = []
         self.equity_curve = [self.initial_balance]
+        self.action_history = []
+        self.consecutive_same_action = 0
+        self.last_action = -1
         
         return self._get_state()
     
@@ -423,14 +449,86 @@ class TradingEnvironment:
         state = self.features[start:end]
         return torch.from_numpy(state)
     
+    def _calculate_unrealized_pnl(self, current_price: float) -> float:
+        """Calculate unrealized PnL for current position."""
+        if self.position == 0:
+            return 0.0
+        elif self.position == 1:  # Long
+            return (current_price - self.entry_price) / self.entry_price
+        else:  # Short
+            return (self.entry_price - current_price) / self.entry_price
+    
+    def _check_risk_limits(self, current_price: float) -> Tuple[bool, str]:
+        """
+        Check if position should be auto-closed due to risk limits.
+        
+        Returns:
+            (should_close, reason)
+        """
+        if self.position == 0:
+            return False, ""
+        
+        unrealized_pnl = self._calculate_unrealized_pnl(current_price)
+        holding_time = self.current_step - self.entry_step
+        
+        # Stop Loss
+        if unrealized_pnl <= -self.stop_loss_pct:
+            return True, "stop_loss"
+        
+        # Take Profit
+        if unrealized_pnl >= self.take_profit_pct:
+            return True, "take_profit"
+        
+        # Max Holding Period
+        if holding_time >= self.max_holding_steps:
+            return True, "max_holding"
+        
+        return False, ""
+    
+    def _get_diversity_bonus(self, action: int) -> float:
+        """
+        Calculate diversity bonus to prevent action collapse.
+        
+        Rewards taking different actions, penalizes repetition.
+        """
+        if action == self.last_action:
+            self.consecutive_same_action += 1
+        else:
+            self.consecutive_same_action = 0
+        
+        # Penalty grows with consecutive same actions
+        if self.consecutive_same_action > 10:
+            return -self.diversity_bonus * (self.consecutive_same_action - 10)
+        
+        # Bonus for switching actions (exploration)
+        if action != self.last_action and self.last_action >= 0:
+            return self.diversity_bonus
+        
+        return 0.0
+    
+    def _get_drawdown_penalty(self) -> float:
+        """Calculate penalty based on current drawdown."""
+        if self.balance >= self.peak_balance:
+            return 0.0
+        
+        drawdown = (self.peak_balance - self.balance) / self.peak_balance
+        
+        # Exponential penalty as drawdown increases
+        if drawdown > 0.05:  # 5%+ drawdown
+            return -self.drawdown_penalty_factor * (drawdown ** 2)
+        
+        return 0.0
+    
     def step(self, action: int) -> Tuple[torch.Tensor, float, bool, Dict]:
         """
         Execute action and return (next_state, reward, done, info).
         
-        REWARD CALCULATION:
-        1. Base reward = position * price_change_pct
-        2. Transaction cost deducted on position changes
-        3. Holding cost (optional, for leverage)
+        PROFESSIONAL REWARD STRUCTURE:
+        1. Base PnL reward (realized + unrealized)
+        2. Risk limit enforcement (stop-loss, take-profit)
+        3. Diversity bonus (anti-collapse)
+        4. Drawdown penalty
+        5. Inaction penalty (no flat positions too long)
         """
         current_price = self.prices[self.current_step]
         prev_price = self.prices[self.current_step - 1]
@@ -438,15 +536,23 @@ class TradingEnvironment:
         
         reward = 0.0
         trade_executed = False
+        close_reason = ""
+        
+        # === CHECK RISK LIMITS FIRST ===
+        should_close, risk_reason = self._check_risk_limits(current_price)
+        if should_close and self.position != 0:
+            # Force close position
+            action = 3  # Override to Close
+            close_reason = risk_reason
         
         # === ACTION LOGIC ===
-        
         if action == 0:  # Long
             if self.position == 0:
                 # Enter long
                 self.position = 1
                 self.entry_price = current_price * (1 + self.transaction_cost)
-                reward -= self.transaction_cost  # Cost to enter
+                self.entry_step = self.current_step
+                reward -= self.transaction_cost
                 trade_executed = True
             elif self.position == -1:
                 # Close short, enter long
@@ -455,15 +561,17 @@ class TradingEnvironment:
                 reward += pnl - self.transaction_cost
                 self.trades.append({
                     'type': 'short', 'pnl': pnl,
-                    'entry': self.entry_price, 'exit': exit_price
+                    'entry': self.entry_price, 'exit': exit_price,
+                    'holding_time': self.current_step - self.entry_step
                 })
                 
                 self.position = 1
                 self.entry_price = current_price * (1 + self.transaction_cost)
+                self.entry_step = self.current_step
                 reward -= self.transaction_cost
                 trade_executed = True
             else:
-                # Already long, hold
+                # Already long, get unrealized PnL
                 reward = price_return
         
         elif action == 1:  # Short
@@ -471,6 +579,7 @@ class TradingEnvironment:
                 # Enter short
                 self.position = -1
                 self.entry_price = current_price * (1 - self.transaction_cost)
+                self.entry_step = self.current_step
                 reward -= self.transaction_cost
                 trade_executed = True
             elif self.position == 1:
@@ -480,15 +589,17 @@ class TradingEnvironment:
                 reward += pnl - self.transaction_cost
                 self.trades.append({
                     'type': 'long', 'pnl': pnl,
-                    'entry': self.entry_price, 'exit': exit_price
+                    'entry': self.entry_price, 'exit': exit_price,
+                    'holding_time': self.current_step - self.entry_step
                 })
                 
                 self.position = -1
                 self.entry_price = current_price * (1 - self.transaction_cost)
+                self.entry_step = self.current_step
                 reward -= self.transaction_cost
                 trade_executed = True
             else:
-                # Already short, hold
+                # Already short, get unrealized PnL
                 reward = -price_return
         
         elif action == 2:  # Hold
@@ -496,7 +607,9 @@ class TradingEnvironment:
                 reward = price_return
             elif self.position == -1:
                 reward = -price_return
-            # If position == 0, reward = 0
+            else:
+                # Flat - small inaction penalty to encourage activity
+                reward = -self.inaction_penalty
         
         elif action == 3:  # Close
             if self.position == 1:
@@ -505,7 +618,9 @@ class TradingEnvironment:
                 reward += pnl - self.transaction_cost
                 self.trades.append({
                     'type': 'long', 'pnl': pnl,
-                    'entry': self.entry_price, 'exit': exit_price
+                    'entry': self.entry_price, 'exit': exit_price,
+                    'holding_time': self.current_step - self.entry_step,
+                    'close_reason': close_reason or 'manual'
                 })
                 self.position = 0
                 self.entry_price = 0.0
@@ -516,19 +631,45 @@ class TradingEnvironment:
                 reward += pnl - self.transaction_cost
                 self.trades.append({
                     'type': 'short', 'pnl': pnl,
-                    'entry': self.entry_price, 'exit': exit_price
+                    'entry': self.entry_price, 'exit': exit_price,
+                    'holding_time': self.current_step - self.entry_step,
+                    'close_reason': close_reason or 'manual'
                 })
                 self.position = 0
                 self.entry_price = 0.0
                 trade_executed = True
+            else:
+                # Already flat - small penalty for useless action
+                reward = -self.inaction_penalty * 0.5
         
-        # Update balance
-        self.balance *= (1 + reward)
+        # === ADDITIONAL REWARD COMPONENTS ===
+        
+        # Diversity bonus (anti-collapse)
+        diversity_reward = self._get_diversity_bonus(action)
+        reward += diversity_reward
+        
+        # Update balance and peak
+        self.balance *= (1 + reward - diversity_reward)  # Don't compound diversity bonus
+        self.peak_balance = max(self.peak_balance, self.balance)
         self.equity_curve.append(self.balance)
+        
+        # Drawdown penalty
+        drawdown_penalty = self._get_drawdown_penalty()
+        reward += drawdown_penalty
+        
+        # Track action history
+        self.action_history.append(action)
+        if len(self.action_history) > 100:
+            self.action_history.pop(0)
+        self.last_action = action
         
         # Advance step
         self.current_step += 1
-        done = self.current_step >= self.max_steps + self.lookback - 1
+        
+        # Check termination conditions
+        current_drawdown = (self.peak_balance - self.balance) / self.peak_balance
+        max_dd_exceeded = current_drawdown >= self.max_drawdown_pct
+        done = self.current_step >= self.max_steps + self.lookback - 1 or max_dd_exceeded
         
         # Get next state
         if not done:
@@ -540,13 +681,19 @@ class TradingEnvironment:
             'position': self.position,
             'balance': self.balance,
             'trade_executed': trade_executed,
-            'price': current_price
+            'price': current_price,
+            'unrealized_pnl': self._calculate_unrealized_pnl(current_price),
+            'drawdown': current_drawdown,
+            'close_reason': close_reason,
+            'diversity_reward': diversity_reward,
+            'drawdown_penalty': drawdown_penalty,
+            'max_dd_exceeded': max_dd_exceeded
         }
         
         return next_state, reward, done, info
     
     def get_performance_metrics(self) -> Dict[str, float]:
-        """Calculate performance metrics from episode."""
+        """Calculate comprehensive performance metrics from episode."""
         equity = np.array(self.equity_curve)
         returns = np.diff(equity) / equity[:-1]
         
@@ -588,6 +735,35 @@ class TradingEnvironment:
             win_rate = 0
             profit_factor = 0
         
+        # Action distribution analysis
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        for a in self.action_history:
+            action_counts[a] = action_counts.get(a, 0) + 1
+        total_actions = len(self.action_history)
+        
+        if total_actions > 0:
+            action_entropy = 0.0
+            for count in action_counts.values():
+                if count > 0:
+                    p = count / total_actions
+                    action_entropy -= p * np.log(p + 1e-10)
+            # Normalize: max entropy is log(4) ≈ 1.39
+            action_entropy_normalized = action_entropy / np.log(4)
+        else:
+            action_entropy_normalized = 0.0
+        
+        # Trade breakdown by close reason
+        close_reasons = {}
+        for t in self.trades:
+            reason = t.get('close_reason', 'manual')
+            close_reasons[reason] = close_reasons.get(reason, 0) + 1
+        
+        # Average holding time
+        if self.trades:
+            avg_holding = np.mean([t.get('holding_time', 0) for t in self.trades])
+        else:
+            avg_holding = 0
+        
         return {
             'total_return': total_return,
             'sharpe_ratio': sharpe,
@@ -595,7 +771,17 @@ class TradingEnvironment:
             'max_drawdown': max_drawdown,
             'win_rate': win_rate,
             'profit_factor': profit_factor,
-            'num_trades': len(self.trades)
+            'num_trades': len(self.trades),
+            'action_entropy': action_entropy_normalized,
+            'action_distribution': {
+                'long': action_counts.get(0, 0),
+                'short': action_counts.get(1, 0),
+                'hold': action_counts.get(2, 0),
+                'close': action_counts.get(3, 0)
+            },
+            'close_reasons': close_reasons,
+            'avg_holding_time': avg_holding,
+            'total_steps': total_actions
         }
 
 
@@ -866,27 +1052,34 @@ class OrionTrainer:
             device='cpu'  # Store on CPU to save GPU memory
         )
         
-        # Model saver
+        # Model saver (handles both best-model and periodic saves)
         self.saver = ModelSaver(
             save_dir=self.config.get('checkpoint_dir', './checkpoints'),
             metric='sortino_ratio'
         )
         
-        # Environments
-        self.train_env = TradingEnvironment(
-            train_data, lookback=lookback,
-            transaction_cost=self.config.get('transaction_cost', 0.001)
-        )
-        self.val_env = TradingEnvironment(
-            val_data, lookback=lookback,
-            transaction_cost=self.config.get('transaction_cost', 0.001)
-        )
-        self.test_env = TradingEnvironment(
-            test_data, lookback=lookback,
-            transaction_cost=self.config.get('transaction_cost', 0.001)
-        )
+        # Trading Environment Config - Professional Risk Management
+        env_config = {
+            'lookback': lookback,
+            'transaction_cost': self.config.get('transaction_cost', 0.001),
+            'stop_loss_pct': self.config.get('stop_loss_pct', 0.02),
+            'take_profit_pct': self.config.get('take_profit_pct', 0.04),
+            'max_holding_steps': self.config.get('max_holding_steps', 288),
+            'max_drawdown_pct': self.config.get('max_drawdown_pct', 0.10),
+            'drawdown_penalty_factor': self.config.get('drawdown_penalty_factor', 2.0),
+            'inaction_penalty': self.config.get('inaction_penalty', 0.0001),
+            'diversity_bonus': self.config.get('diversity_bonus', 0.0005),
+        }
+        
+        # Environments with professional risk management
+        self.train_env = TradingEnvironment(train_data, **env_config)
+        self.val_env = TradingEnvironment(val_data, **env_config)
+        self.test_env = TradingEnvironment(test_data, **env_config)
         
         logger.info("Training setup complete!")
+        logger.info(f"Environment Config: stop_loss={env_config['stop_loss_pct']*100:.1f}%, "
+                   f"take_profit={env_config['take_profit_pct']*100:.1f}%, "
+                   f"max_holding={env_config['max_holding_steps']} steps")
     
     def _update_target_network(self, tau: float = 0.005) -> None:
         """
@@ -925,11 +1118,14 @@ class OrionTrainer:
             show_progress: Whether to show progress bar
             
         Returns:
-            Statistics from collection
+            Statistics from collection including action distribution
         """
         state = self.train_env.reset()
         total_reward = 0
         episode_rewards = []
+        
+        # Track action distribution for anti-collapse monitoring
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Long, Short, Hold, Close
         
         collection_start = time.time()
         for step in range(num_steps):
@@ -938,10 +1134,20 @@ class OrionTrainer:
                 pct = step / num_steps * 100
                 elapsed = time.time() - collection_start
                 eta = (elapsed / step) * (num_steps - step)
+                
+                # Calculate action distribution so far
+                total_actions = sum(action_counts.values())
+                if total_actions > 0:
+                    action_dist = {k: v/total_actions*100 for k, v in action_counts.items()}
+                    dist_str = f"L:{action_dist[0]:.0f}% S:{action_dist[1]:.0f}% H:{action_dist[2]:.0f}% C:{action_dist[3]:.0f}%"
+                else:
+                    dist_str = "N/A"
+                
                 logger.info(
                     f"  Collecting data: [{pct:3.0f}%] {step}/{num_steps} steps | "
-                    f"ETA: {int(eta)}s | Buffer: {len(self.replay_buffer)}"
+                    f"Actions: {dist_str} | ETA: {int(eta)}s"
                 )
+            
             # Select action
             state_tensor = state.unsqueeze(0).to(self.device)
             action, _ = self.model.select_action(
@@ -950,6 +1156,7 @@ class OrionTrainer:
                 epsilon=epsilon
             )
             action = action.item()
+            action_counts[action] = action_counts.get(action, 0) + 1
             
             # Step environment
             next_state, reward, done, info = self.train_env.step(action)
@@ -967,9 +1174,20 @@ class OrionTrainer:
                 total_reward = 0
                 state = self.train_env.reset()
         
+        # Compute action entropy (diversity measure)
+        total_actions = sum(action_counts.values())
+        action_entropy = 0.0
+        for count in action_counts.values():
+            if count > 0 and total_actions > 0:
+                p = count / total_actions
+                action_entropy -= p * np.log(p + 1e-10)
+        action_entropy_normalized = action_entropy / np.log(4)  # Max entropy = log(4)
+        
         return {
             'avg_episode_reward': np.mean(episode_rewards) if episode_rewards else 0,
-            'num_transitions': num_steps
+            'num_transitions': num_steps,
+            'action_distribution': action_counts,
+            'action_entropy': action_entropy_normalized
         }
     
     def train_step(self, batch_size: int) -> float:
@@ -1128,6 +1346,18 @@ class OrionTrainer:
         logger.info(f"  Avg Win:       {avg_win*100:+.2f}%")
         logger.info(f"  Avg Loss:      {avg_loss*100:+.2f}%")
         logger.info(f"  Profit Factor: {metrics.get('profit_factor', 0):.2f}")
+        
+        # Close reasons breakdown
+        close_reasons = metrics.get('close_reasons', {})
+        if close_reasons:
+            logger.info("-" * 40)
+            logger.info("CLOSE REASONS:")
+            for reason, count in close_reasons.items():
+                logger.info(f"  {reason}: {count}")
+        
+        # Action entropy (diversity metric)
+        action_entropy = metrics.get('action_entropy', 0)
+        
         logger.info("-" * 40)
         logger.info("ACTION DISTRIBUTION:")
         for i, name in enumerate(action_names):
@@ -1135,6 +1365,13 @@ class OrionTrainer:
             pct = count / len(actions_taken) * 100 if actions_taken else 0
             bar = '█' * int(pct / 5)  # Simple bar chart
             logger.info(f"  {name:6s}: {count:5d} ({pct:5.1f}%) {bar}")
+        logger.info(f"  Entropy: {action_entropy:.3f} (1.0 = uniform, <0.5 = collapsed)")
+        
+        # Collapse warning
+        max_action_pct = max(action_counts.values()) / len(actions_taken) * 100 if actions_taken else 0
+        if max_action_pct > 70:
+            logger.warning(f"⚠️  POLICY COLLAPSE: Single action = {max_action_pct:.1f}% of all actions!")
+        
         logger.info("=" * 60)
         
         self.model.train()
@@ -1258,6 +1495,26 @@ class OrionTrainer:
             )
             collect_time = time.time() - collect_start
             
+            # CHECK FOR ACTION COLLAPSE (early warning)
+            action_dist = collection_stats.get('action_distribution', {})
+            action_entropy = collection_stats.get('action_entropy', 0)
+            total_actions = sum(action_dist.values()) if action_dist else 0
+            if total_actions > 0:
+                max_action_pct = max(action_dist.values()) / total_actions * 100
+                if max_action_pct > 80:
+                    logger.warning(f"⚠️  ACTION COLLAPSE DETECTED! One action = {max_action_pct:.1f}% of choices")
+                    logger.warning(f"    Action distribution: {action_dist}")
+                    logger.warning(f"    Entropy: {action_entropy:.3f} (target: >0.8)")
+            
+            # Log action distribution for this epoch
+            if total_actions > 0:
+                dist_pcts = {k: v/total_actions*100 for k, v in action_dist.items()}
+                logger.info(
+                    f"  Actions: Long:{dist_pcts.get(0,0):.1f}% Short:{dist_pcts.get(1,0):.1f}% "
+                    f"Hold:{dist_pcts.get(2,0):.1f}% Close:{dist_pcts.get(3,0):.1f}% | "
+                    f"Entropy: {action_entropy:.3f}"
+                )
+            
             # ================================================================
             # PHASE 2: Training Updates with Progress
             # ================================================================
@@ -1305,8 +1562,18 @@ class OrionTrainer:
             
             update_time = time.time() - update_start
             
-            # Decay epsilon
-            epsilon = max(final_epsilon, epsilon * epsilon_decay)
+            # SMART EPSILON DECAY: Only decay if policy is diverse enough
+            # This prevents collapsing into a single action
+            current_entropy = collection_stats.get('action_entropy', 0)
+            min_entropy_for_decay = 0.6  # Need at least 60% of max entropy to decay
+            
+            if current_entropy >= min_entropy_for_decay:
+                epsilon = max(final_epsilon, epsilon * epsilon_decay)
+            else:
+                # Keep exploration high if policy is collapsing
+                logger.warning(f"⚠️  Entropy too low ({current_entropy:.3f}), keeping ε={epsilon:.4f}")
+                # Actually INCREASE epsilon slightly to encourage exploration
+                epsilon = min(1.0, epsilon * 1.02)
             
             # Scheduler step
             self.scheduler.step()
@@ -1899,60 +2166,66 @@ def main():
     # Auto-detect optimal batch size
     optimal_batch = get_optimal_batch_size()
     
-    # Configuration
+    # Configuration - PROFESSIONAL-GRADE SETTINGS
     config = {
         # Data
         'years_of_history': 5,
         'cache_dir': './data_cache',
         
-        # Model - Reduced for memory efficiency
+        # Model - Balanced for RTX 4090
         'hidden_dim': 128,      # Reduced from 256
         'num_heads': 4,         # Reduced from 8
         'num_lstm_layers': 2,
         'num_quantiles': 25,    # Reduced from 51
-        'lookback': 64,         # 5.3 hours at 5m (reduced from 96)
+        'lookback': 64,         # 5.3 hours at 5m
         'dropout': 0.1,
         
-        # Training - Emergency fix: drastically reduced for debugging
-        'num_epochs': 100,
+        # Training - OPTIMIZED FOR CONVERGENCE
+        'num_epochs': 200,      # More epochs for proper learning
         'batch_size': optimal_batch,  # Auto-detected based on GPU memory
-        'steps_per_epoch': 500, # Reduced from 1500
-        'updates_per_step': 1,  # Reduced from 4 - CRITICAL FIX for slow training
-        'lr': 3e-4,
+        'steps_per_epoch': 1000,  # More experience per epoch
+        'updates_per_step': 4,    # RESTORED: More gradient updates per step
+        'lr': 1e-4,               # Lower LR for stability
         'weight_decay': 1e-5,
         'gamma': 0.99,
         'max_grad_norm': 1.0,
         'use_ranger': True,
         
-        # Scheduler
-        'scheduler_t0': 10,
+        # Scheduler - SLOWER warmup
+        'scheduler_t0': 20,       # Longer initial cycle
         'scheduler_t_mult': 2,
         'scheduler_eta_min': 1e-6,
         
-        # Exploration
-        'initial_epsilon': 1.0,
-        'final_epsilon': 0.01,
-        'epsilon_decay': 0.995,
+        # Exploration - CRITICAL: HIGHER exploration, SLOWER decay
+        'initial_epsilon': 1.0,   # Start with 100% random
+        'final_epsilon': 0.05,    # Never go below 5% exploration
+        'epsilon_decay': 0.99,    # SLOWER decay (was 0.995 → too fast)
         
         # Replay buffer - larger for diversity
-        'buffer_size': 200_000,
+        'buffer_size': 500_000,   # Larger buffer for more diverse experience
         
-        # Target network
-        'target_update_freq': 100,
+        # Target network - CRITICAL: More frequent updates
+        'target_update_freq': 200,  # Sync target every 200 steps
         
-        # Trading
-        'transaction_cost': 0.001,
-        'risk_level': 'neutral',
+        # Trading Environment - PROFESSIONAL RISK MANAGEMENT
+        'transaction_cost': 0.001,   # 0.1% per trade
+        'stop_loss_pct': 0.02,       # 2% stop loss per trade
+        'take_profit_pct': 0.04,     # 4% take profit (2:1 R/R ratio)
+        'max_holding_steps': 288,    # Max 1 day holding
+        'max_drawdown_pct': 0.10,    # 10% max portfolio drawdown
+        'drawdown_penalty_factor': 2.0,
+        'inaction_penalty': 0.0001,  # Penalty for staying flat
+        'diversity_bonus': 0.0005,   # Bonus for action diversity
         
         # Periodic backtest
-        'backtest_freq': 20,  # Run backtest every N epochs (reduced for speed)
+        'backtest_freq': 10,  # Run backtest every 10 epochs
         
         # Checkpoints
         'checkpoint_dir': './checkpoints'
     }
     
     logger.info("=" * 60)
-    logger.info("O.R.I.O.N. - Training Pipeline")
+    logger.info("O.R.I.O.N. - BLACKROCK-GRADE Training Pipeline")
     logger.info("=" * 60)
     logger.info(f"Config: {json.dumps(config, indent=2)}")
     
