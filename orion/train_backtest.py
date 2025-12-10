@@ -681,6 +681,53 @@ class ModelSaver:
         
         return False
     
+    def save_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
+        metrics: Dict[str, float],
+        config: Dict[str, Any],
+        is_periodic: bool = False
+    ) -> None:
+        """
+        Save checkpoint regardless of performance (periodic backup).
+        
+        Args:
+            model: Model to save
+            optimizer: Optimizer state
+            epoch: Current epoch
+            metrics: Current metrics
+            config: Training config
+            is_periodic: Whether this is a periodic save
+        """
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'metrics': metrics,
+            'config': config
+        }
+        
+        # Save as checkpoint_epochXX.pt for periodic saves
+        if is_periodic:
+            path = self.save_dir / f'checkpoint_epoch{epoch+1:03d}.pt'
+        else:
+            path = self.save_dir / f'latest_checkpoint.pt'
+        
+        torch.save(checkpoint, path)
+        
+        # Save metrics
+        metrics_path = path.with_suffix('.json')
+        with open(metrics_path, 'w') as f:
+            json.dump({
+                'epoch': epoch,
+                'metrics': {k: float(v) for k, v in metrics.items()},
+                'timestamp': datetime.now().isoformat()
+            }, f, indent=2)
+        
+        logger.info(f"💾 Checkpoint saved: {path.name}")
+    
     def load_best(self, model: nn.Module, device: str = 'cuda') -> Dict:
         """Load the best checkpoint."""
         path = self.save_dir / 'best_model.pt'
@@ -1294,6 +1341,17 @@ class OrionTrainer:
                 val_metrics,
                 self.config
             )
+            
+            # Periodic checkpoint save (every 10 epochs, regardless of performance)
+            if (epoch + 1) % 10 == 0:
+                self.saver.save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    epoch,
+                    val_metrics,
+                    self.config,
+                    is_periodic=True
+                )
             
             # ================================================================
             # PERIODIC BACKTEST (every N epochs) - saves most profitable model
